@@ -360,8 +360,11 @@ class Sampler(nn.Module):
                     "Sampling seed is not supported for flashinfer backend"
                 )
                 if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    # Skip identity renorms (top_k all / top_p 1): each is a full pass.
+                    if sampling_info.need_top_k_sampling:
+                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    if sampling_info.need_top_p_sampling:
+                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
