@@ -62,6 +62,7 @@ class GrammarManager:
         self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = (
             envs.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS.get()
         )
+        self._last_wait_count_time = 0.0
 
     def __len__(self):
         return len(self.grammar_queue)
@@ -200,9 +201,12 @@ class GrammarManager:
 
         return add_to_grammar_queue
 
-    def get_ready_grammar_requests(self) -> List[Req]:
+    def get_ready_grammar_requests(self, block: bool = True) -> List[Req]:
         """
         Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
+
+        block=True polls for up to SGLANG_GRAMMAR_POLL_INTERVAL; block=False makes a
+        single readiness pass so a busy scheduler does not stall on pending compiles.
 
         For PP0, DP/TP group rank i returns two sets ready_reqs_i,
         failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
@@ -237,15 +241,26 @@ class GrammarManager:
                     if req.grammar.done():
                         ready_req_idxs.add(i)
 
-                if len(ready_req_idxs) == len(self.grammar_queue):
+                if not block or len(ready_req_idxs) == len(self.grammar_queue):
                     break
 
                 # Sleep a bit to avoid busy waiting
                 time.sleep(self.SGLANG_GRAMMAR_POLL_INTERVAL / 10)
 
+            # A blocking call lasts at least one poll interval when anything is
+            # pending; count non-blocking calls at most once per interval so the
+            # timeout stays MAX_POLL_ITERATIONS * POLL_INTERVAL of wall clock.
+            now = time.perf_counter()
+            count_wait = (
+                block
+                or now - self._last_wait_count_time >= self.SGLANG_GRAMMAR_POLL_INTERVAL
+            )
+            if count_wait:
+                self._last_wait_count_time = now
+
             # Check failed requests
             for i, req in enumerate(self.grammar_queue):
-                if i not in ready_req_idxs:
+                if count_wait and i not in ready_req_idxs:
                     # grammar_wait_ct is only updated on PP0; later PP ranks
                     # receive PP0's ready/failed decision through PP sync.
                     self.grammar_queue[i].grammar_wait_ct += 1

@@ -3813,7 +3813,9 @@ class Scheduler(
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
+            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests(
+                block=running_batch.is_empty()
+            )
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 

@@ -14,6 +14,7 @@ Usage:
     python -m pytest test_grammar_manager.py -v
 """
 
+import time
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -621,6 +622,39 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertIs(result[0], ready_req)
         self.assertEqual(len(mgr.grammar_queue), 1)
         self.assertIs(mgr.grammar_queue[0], pending_req)
+
+    def test_nonblocking_pending_returns_without_polling(self):
+        mgr = self._make_mgr()
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.5
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
+
+        grammar_obj = MagicMock(spec=BaseGrammarObject)
+        grammar_obj.copy.return_value = grammar_obj
+        done_future = Future()
+        done_future.set_result(grammar_obj)
+        ready_req = _make_req(json_schema="ready", rid="r1")
+        ready_req.grammar = done_future
+        ready_req.grammar_key = ("json", "ready")
+        pending_req = _make_req(json_schema="pending", rid="r2")
+        pending_req.grammar = Future()
+        pending_req.grammar_key = ("json", "pending")
+        pending_req.grammar_wait_ct = 0
+        mgr.grammar_queue = [ready_req, pending_req]
+
+        start = time.perf_counter()
+        result = mgr.get_ready_grammar_requests(block=False)
+        self.assertLess(time.perf_counter() - start, 0.1)
+        self.assertEqual(result, [ready_req])
+        self.assertEqual(mgr.grammar_queue, [pending_req])
+        self.assertEqual(pending_req.grammar_wait_ct, 1)
+
+        # A second call within one poll interval does not advance the timeout.
+        self.assertEqual(mgr.get_ready_grammar_requests(block=False), [])
+        self.assertEqual(pending_req.grammar_wait_ct, 1)
+
+        mgr._last_wait_count_time -= mgr.SGLANG_GRAMMAR_POLL_INTERVAL
+        mgr.get_ready_grammar_requests(block=False)
+        self.assertEqual(pending_req.grammar_wait_ct, 2)
 
     def test_empty_queue(self):
         """get_ready_grammar_requests on empty queue should return empty list."""
