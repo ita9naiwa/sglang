@@ -35,6 +35,7 @@ from sglang.srt.utils.common import (
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
+        sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
     from sgl_kernel import (
@@ -73,6 +74,9 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+# ponytail: B300-screened crossover; below this many rows the torch draw beats
+# flashinfer's fused sampler (one CTA per row underfills the GPU).
+_FLASHINFER_SAMPLE_MIN_ROWS = 48
 
 
 def _trace_e2e_sampler(stage: str, **fields) -> None:
@@ -336,11 +340,20 @@ class Sampler(nn.Module):
             )
 
         if simple_sampling_case:
-            batch_next_token_ids = sampling_from_probs_torch(
-                probs,
-                sampling_seed=sampling_info.sampling_seed,
-                positions=positions,
-            )
+            if (
+                sampling_info.sampling_seed is None
+                and probs.is_cuda
+                and probs.shape[0] >= _FLASHINFER_SAMPLE_MIN_ROWS
+                and get_exec().kernel.sampling_backend == "flashinfer"
+            ):
+                # One fused kernel instead of the multi-pass torch draw.
+                batch_next_token_ids = sampling_from_probs(probs)
+            else:
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
             if return_sampling_mask:
                 capture_probs = select_capture_rows(probs)
                 capture_tokens = select_capture_rows(batch_next_token_ids)
