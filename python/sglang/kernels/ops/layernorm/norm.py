@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -177,3 +179,47 @@ def fused_inplace_qknorm_across_heads(
     """
     module = _jit_qknorm_across_heads_module(q.dtype)
     module.qknorm_across_heads(q, k, q_weight, k_weight, eps)
+
+
+@triton.jit
+def _gemma_norm_add_norm_kernel(
+    x_ptr, res_ptr, w1_ptr, w2_ptr, n_cols, stride_x, stride_r, eps1, eps2, BLOCK_N: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(w1_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd1 = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / n_cols + eps1)
+    # Round h to the activation dtype, as the separate gemma_rmsnorm output would be.
+    h = (x * rstd1 * (1.0 + w1)).to(x_ptr.dtype.element_ty).to(tl.float32)
+    r = tl.load(res_ptr + row * stride_r + cols, mask=mask, other=0.0).to(tl.float32)
+    s = h + r
+    tl.store(res_ptr + row * stride_r + cols, s.to(res_ptr.dtype.element_ty), mask=mask)
+    w2 = tl.load(w2_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd2 = 1.0 / tl.sqrt(tl.sum(s * s, axis=0) / n_cols + eps2)
+    tl.store(x_ptr + row * stride_x + cols, (s * rstd2 * (1.0 + w2)).to(x_ptr.dtype.element_ty), mask=mask)
+
+
+def gemma_norm_add_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gemma RMSNorm(x, w1) -> add into residual -> Gemma RMSNorm(residual, w2), one kernel.
+
+    Same result as gemma_rmsnorm followed by gemma_fused_add_rmsnorm. Writes the output
+    into x's storage and updates residual in place; returns (x, residual).
+    """
+    n = x.shape[-1]
+    assert x.stride(-1) == 1 and residual.stride(-1) == 1
+    x2, r2 = x.view(-1, n), residual.view(-1, n)
+    block_n = triton.next_power_of_2(n)
+    _gemma_norm_add_norm_kernel[(x2.shape[0],)](
+        x2, r2, weight1, weight2, n, x2.stride(0), r2.stride(0), eps1, eps2,
+        BLOCK_N=block_n, num_warps=8 if block_n >= 1024 else 4,
+    )
+    return x, residual

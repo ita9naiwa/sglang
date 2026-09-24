@@ -42,9 +42,13 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.kernels.ops.layernorm.norm import gemma_norm_add_norm
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -261,11 +265,20 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual
-        )
+        if _is_cuda:
+            hidden_states, residual = gemma_norm_add_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.pre_feedforward_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states, residual = self.pre_feedforward_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
