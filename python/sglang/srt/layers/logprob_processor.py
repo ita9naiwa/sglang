@@ -47,6 +47,7 @@ class LogprobResult:
     top_logprobs_idx: Optional[List] = None
     token_ids_logprobs_val: Optional[List] = None
     token_ids_logprobs_idx: Optional[List] = None
+    top_logprobs_dense: Optional[Tuple] = None
     input_copy_done: Optional[torch.cuda.Event] = None
 
     def write_input_to(self, logits_output: LogitsProcessorOutput) -> None:
@@ -66,6 +67,7 @@ class LogprobResult:
         if self.top_logprobs_val is not None:
             logits_output.next_token_top_logprobs_val = self.top_logprobs_val
             logits_output.next_token_top_logprobs_idx = self.top_logprobs_idx
+            logits_output.next_token_top_logprobs_dense = self.top_logprobs_dense
         if self.token_ids_logprobs_val is not None:
             logits_output.next_token_token_ids_logprobs_val = (
                 self.token_ids_logprobs_val
@@ -925,10 +927,21 @@ class OutputLogprobProcessor:
 
         result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
-            (
+            # Same per-row views as get_top_logprobs, plus the dense topk so the
+            # result copy can move one [bs, max_k] tensor instead of 2 * bs rows.
+            values, indices = logprobs.topk(max(top_logprobs_nums), dim=-1)
+            result.top_logprobs_val = [
+                values[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
+            result.top_logprobs_idx = [
+                indices[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
+            result.top_logprobs_dense = (
                 result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+                values,
+                indices,
+                list(top_logprobs_nums),
+            )
 
         if any(x is not None for x in token_ids_logprobs):
             (

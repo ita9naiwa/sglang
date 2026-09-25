@@ -220,6 +220,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    # Sampler-only dense backing of the two lists above:
+    # (val list it backs, values [#seq, max_k], indices [#seq, max_k], k per seq).
+    next_token_top_logprobs_dense: Optional[Tuple] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -269,6 +272,33 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def live_top_logprobs_dense(self) -> Optional[Tuple]:
+        """The dense backing, unless a later producer replaced the val list."""
+        dense = self.next_token_top_logprobs_dense
+        if dense is not None and dense[0] is self.next_token_top_logprobs_val:
+            return dense
+        return None
+
+    def next_token_top_logprobs_tolist(self) -> None:
+        """Turn the next-token top-logprob rows into per-seq python lists."""
+        dense = self.live_top_logprobs_dense()
+        self.next_token_top_logprobs_dense = None
+        if dense is not None:
+            _, values, indices, nums = dense
+            self.next_token_top_logprobs_val = [
+                row[:k] for row, k in zip(values.tolist(), nums)
+            ]
+            self.next_token_top_logprobs_idx = [
+                row[:k] for row, k in zip(indices.tolist(), nums)
+            ]
+        elif self.next_token_top_logprobs_val:
+            self.next_token_top_logprobs_val = [
+                v.tolist() for v in self.next_token_top_logprobs_val
+            ]
+            self.next_token_top_logprobs_idx = [
+                x.tolist() for x in self.next_token_top_logprobs_idx
+            ]
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
