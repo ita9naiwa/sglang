@@ -153,15 +153,25 @@ def get_token_ids_logprobs_raw(
     vals, idxs = [], []
     pin_memory = is_pin_memory_available(logprobs.device)
     if stage == LogprobStage.DECODE:
+        # One H2D and one gather for every requested (row, id) pair, then split
+        # per request by the host-known lengths.
+        lens, rows, cols = [], [], []
         for i, token_ids in enumerate(token_ids_logprobs_list):
+            if token_ids is not None:
+                lens.append(len(token_ids))
+                rows.extend([i] * len(token_ids))
+                cols.extend(token_ids)
+        if lens:
+            index = torch.tensor(
+                [rows, cols], dtype=torch.long, pin_memory=pin_memory
+            ).to(logprobs.device, non_blocking=True)
+            split_rows = iter(logprobs[index[0], index[1]].split(lens))
+        for token_ids in token_ids_logprobs_list:
             if token_ids is None:
                 vals.append([])
                 idxs.append([])
             else:
-                token_ids_tensor = torch.tensor(
-                    token_ids, dtype=torch.long, pin_memory=pin_memory
-                ).to(logprobs.device, non_blocking=True)
-                row = logprobs[i, token_ids_tensor]
+                row = next(split_rows)
                 vals.append(row if no_copy_to_cpu else row.tolist())
                 idxs.append(token_ids)
     else:  # prefill
