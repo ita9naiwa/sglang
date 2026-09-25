@@ -2910,13 +2910,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
         else:
-            assert self.tokenizer is not None
-            # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
-            # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
-                [[idx] for idx in token_logprobs_idx]
-            )
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+            tokenizer = self.tokenizer
+            assert tokenizer is not None
+            # Decoding one id is a pure function of (tokenizer, id), so memoize it
+            # per tokenizer object; the cache is bounded by the vocab size.
+            cache = getattr(self, "_logprob_token_texts", None)
+            if cache is None or cache[0] is not tokenizer:
+                cache = self._logprob_token_texts = (tokenizer, {})
+            texts = cache[1]
+            misses = [
+                idx for idx in dict.fromkeys(token_logprobs_idx) if idx not in texts
+            ]
+            if misses:
+                # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
+                # into one string. Wrap each ID in its own list so they decode separately.
+                texts.update(
+                    zip(misses, tokenizer.batch_decode([[idx] for idx in misses]))
+                )
+            return [
+                (logprob, idx, texts[idx])
+                for logprob, idx in zip(token_logprobs_val, token_logprobs_idx)
+            ]
 
     def detokenize_top_logprobs_tokens(
         self,
