@@ -321,7 +321,7 @@ __all__ = [
 
 # Triton kernel migrated into this group (from layers/triton_ops/softcap);
 # registered for inventory. Import it from its module.
-for _fn in ("softcap_out", "softcap_inplace_logits"):
+for _fn in ("softcap_out", "softcap_inplace_logits", "softcap_copy_to_fp32"):
     register_kernel(
         KernelSpec(
             op=f"activation.{_fn}",

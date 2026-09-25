@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    softcap_copy_to_fp32,
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
@@ -914,11 +915,20 @@ class LogitsProcessor(nn.Module):
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
 
+        # Fold the softcap into the fp32 upcast: one pass instead of two.
+        fuse_softcap = (
+            bool(self.final_logit_softcapping)
+            and not (_is_npu or _is_cpu)
+            and logits.dtype != torch.float32
+        )
         logits = self._copy_logits_to_buffer(
-            logits, logits_metadata, use_buffer=use_logits_buffer
+            logits,
+            logits_metadata,
+            use_buffer=use_logits_buffer,
+            softcap=self.final_logit_softcapping if fuse_softcap else None,
         )
 
-        if self.final_logit_softcapping:
+        if self.final_logit_softcapping and not fuse_softcap:
             if not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
@@ -1117,6 +1127,7 @@ class LogitsProcessor(nn.Module):
         logits: torch.Tensor,
         logits_metadata: LogitsMetadata,
         use_buffer: bool = True,
+        softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
@@ -1128,8 +1139,16 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
+            if softcap:
+                return softcap_copy_to_fp32(logits_buffer, logits, softcap)
             logits_buffer.copy_(logits)
             logits = logits_buffer
+        elif softcap:
+            return softcap_copy_to_fp32(
+                torch.empty(logits.shape, dtype=torch.float, device=logits.device),
+                logits,
+                softcap,
+            )
         else:
             logits = logits.float()
         return logits

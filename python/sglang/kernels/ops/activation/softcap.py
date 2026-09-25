@@ -118,3 +118,57 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
+
+
+@triton.jit
+def softcap_copy_to_fp32_kernel(
+    dst_ptr,
+    src_ptr,
+    softcapping_value,
+    ncols,
+    dst_row_stride,
+    src_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(1).to(tl.int64)
+    pid = tl.program_id(0).to(tl.int64)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < ncols
+
+    # Same fp32 op sequence as softcap_inplace_logits_kernel, so results match
+    # an upcast followed by the in-place softcap bit for bit.
+    x = tl.load(src_ptr + row * src_row_stride + offsets, mask=mask).to(tl.float32)
+    x = x / softcapping_value
+    x = libdevice.tanh(x)
+    x = x * softcapping_value
+
+    tl.store(dst_ptr + row * dst_row_stride + offsets, x, mask=mask)
+
+
+def softcap_copy_to_fp32(dst, src, final_logit_softcapping):
+    """dst = softcap(src.float()) in one pass; src rows may be strided."""
+    assert dst.dtype == torch.float32 and dst.shape == src.shape
+    if dst.is_contiguous() and src.is_contiguous():
+        nrows, ncols = 1, src.numel()
+        dst_row_stride = src_row_stride = ncols
+    else:
+        assert src.ndim == 2, "non-contiguous softcap copy requires 2D tensors"
+        assert src.stride(1) == 1 and dst.stride(1) == 1, (
+            "non-contiguous softcap copy requires contiguous columns"
+        )
+        nrows, ncols = src.shape
+        dst_row_stride, src_row_stride = dst.stride(0), src.stride(0)
+
+    BLOCK_SIZE = 1024
+    grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
+
+    softcap_copy_to_fp32_kernel[grid](
+        dst_ptr=dst,
+        src_ptr=src,
+        softcapping_value=final_logit_softcapping,
+        ncols=ncols,
+        dst_row_stride=dst_row_stride,
+        src_row_stride=src_row_stride,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return dst
